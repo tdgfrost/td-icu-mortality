@@ -1,0 +1,13 @@
+# This file may be used to create an environment using:
+# $ conda create --name <env> --file <this file> -c conda-forge
+h5py=3.11.0
+inquirer=3.1.4
+numpy=2.1.1
+polars=1.7.1
+python=3.11.10
+pytorch=2.4.0
+tensorboard=2.17.1
+
+# Additionally, run the following commands:
+# conda activate ENV_NAME
+# pip install torcheval==0.0.7 tensordict==0.5.0

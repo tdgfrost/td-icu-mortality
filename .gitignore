@@ -1,0 +1,10 @@
+.DS_Store
+.idea
+data
+temp-mimic
+utils/train/__pycache__
+utils/__pycache__
+utils/parquet_conversion/__pycache__
+utils/preprocessing/__pycache__
+models
+logs
