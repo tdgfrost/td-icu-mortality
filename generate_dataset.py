@@ -35,6 +35,9 @@ def build_mimic_data(input_window_size=168, context_length=400, next_state_delay
     labels = create_labels_for_mimic(combined_data, admissions, patients, input_window_size, next_state_delay,
                                      next_state_window)
 
+    # Get our SOFA score for baseline comparison
+    labels, combined_data = add_sofa_to_labels_in_mimic(labels, combined_data)
+
     # Save the patient IDs
     save_patient_ids_for_mimic(train_patient_ids, val_patient_ids, test_patient_ids)
 
@@ -58,7 +61,7 @@ def build_mimic_data(input_window_size=168, context_length=400, next_state_delay
                 f.write(feature + '\n') if feature != features[-1] else f.write(feature)
         f.close()
 
-    label_features = ['1-day-died', '3-day-died', '7-day-died', '14-day-died', '28-day-died']
+    label_features = ['1-day-died', '3-day-died', '7-day-died', '14-day-died', '28-day-died', 'SOFA']
     with open('./data/label_features.txt', 'w') as f:
         for label_feature in label_features:
             f.write(label_feature + '\n') if label_feature != label_features[-1] else f.write(label_feature)

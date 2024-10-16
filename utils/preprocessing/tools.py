@@ -70,6 +70,169 @@ def add_demographics_for_sicdb(df, cases):
     return df
 
 
+def add_sofa_to_labels_in_mimic(labels, combined_data):
+    sofa_score = combined_data.clone().drop('endtime', 'bolus', 'bolusuom')
+    # Pull our SOFA score variables into individual columns
+    for feature in ["Blood Gas PaO2", 'FiO2', 'MAP', 'GCS - Eye', 'GCS - Motor', 'GCS - Verbal', 'On ventilation',
+                    'Platelets', 'Bilirubin', 'Creatinine']:
+        sofa_score = sofa_score.with_columns(
+            [pl.when(pl.col('feature') == feature).then(pl.col('valuenum').alias(feature)).otherwise(pl.lit(None))])
+    for feature in ['Dopamine', 'Dobutamine', 'Adrenaline', 'Noradrenaline']:
+        sofa_score = sofa_score.with_columns(
+            [pl.when(pl.col('feature') == feature).then(pl.col('rate').alias(feature)).otherwise(pl.lit(None))])
+
+    # Convert the individual GCS elements to a single GCS score
+    sofa_score = (
+        sofa_score.with_columns([
+            (pl.col('GCS - Eye').max() + pl.col('GCS - Motor').max() + pl.col('GCS - Verbal').max())
+            .alias('GCS').over('subject_id', 'starttime')])
+        .drop('GCS - Eye', 'GCS - Motor', 'GCS - Verbal', 'valuenum', 'rate', 'feature')
+        .unique()
+        .sort('subject_id', 'starttime')
+    )
+
+    # Focus on rows with SOFA relevant data
+    sofa_score = sofa_score.filter(
+        pl.col('Blood Gas PaO2').is_not_null() | pl.col('FiO2').is_not_null() | pl.col('MAP').is_not_null()
+        | pl.col('GCS').is_not_null() | pl.col('On ventilation').is_not_null() | pl.col('Platelets').is_not_null()
+        | pl.col('Bilirubin').is_not_null() | pl.col('Creatinine').is_not_null() | pl.col('Dopamine').is_not_null()
+        | pl.col('Dobutamine').is_not_null() | pl.col('Adrenaline').is_not_null() | pl.col('Noradrenaline').is_not_null())
+
+    # Fill in missing patientweight values (as we need to convert our rates to mcg/kg/min)
+    sofa_score = sofa_score.with_columns([
+        pl.col('patientweight')
+        .fill_null(strategy='forward')
+        .fill_null(strategy='backward')
+        .fill_null(value=70).over('subject_id')])
+
+    # Convert the rates to mcg/kg/min
+    sofa_score = (
+        sofa_score.with_columns([
+            pl.when(pl.col('rateuom') == 'mg/minute')
+            .then(pl.col('Dopamine', 'Dobutamine', 'Noradrenaline') * 1000 / pl.col('patientweight'))
+            .otherwise(pl.lit(None))
+        ])
+        .with_columns([
+            pl.when(pl.col('rateuom') == 'mcg/minute')
+            .then(pl.col('Adrenaline') / pl.col('patientweight'))
+            .otherwise(pl.lit(None))
+        ])
+    )
+
+    # Change FiO2 to decimal rather than percentage
+    sofa_score = sofa_score.with_columns([pl.col('FiO2') / 100])
+
+    # Use a rolling window to get the "worst" values for the last 24 hours at each timepoint
+    sofa_score = (
+        sofa_score
+        # Fill nulls so we can get SOFA scores everywhere
+        .with_columns([
+            pl.col(feature).fill_null(strategy='forward').over('subject_id')
+            for feature in ['Blood Gas PaO2', 'FiO2', 'MAP', 'GCS', 'On ventilation', 'Platelets', 'Bilirubin',
+                            'Creatinine', 'Dopamine', 'Dobutamine', 'Adrenaline', 'Noradrenaline']
+        ])
+        .with_columns([
+            # pl.col('Blood Gas PaO2').fill_null(value=100),
+            # pl.col('FiO2').fill_null(value=0.21),
+            # pl.col('MAP').fill_null(value=100),
+            # pl.col('GCS').fill_null(value=15),
+            pl.col('On ventilation').fill_null(value=False),
+            # pl.col('Platelets').fill_null(value=200),
+            # pl.col('Bilirubin').fill_null(value=10),
+            # pl.col('Creatinine').fill_null(value=50),
+            # pl.col('Dopamine').fill_null(value=0),
+            # pl.col('Dobutamine').fill_null(value=0),
+            # pl.col('Adrenaline').fill_null(value=0),
+            # pl.col('Noradrenaline').fill_null(value=0)
+        ])
+        .rolling(index_column='starttime', period='24h', group_by='subject_id')
+        .agg(pl.col('Blood Gas PaO2').min(), pl.col('FiO2').max(), pl.col('MAP').min(), pl.col('GCS').min(),
+             pl.col('On ventilation').max(), pl.col('Platelets').min(), pl.col('Bilirubin').max(),
+             pl.col('Creatinine').max(), pl.col('Dopamine').max(), pl.col('Dobutamine').max(),
+             pl.col('Adrenaline').max(), pl.col('Noradrenaline').max())
+        .with_columns([pl.col('On ventilation').cast(pl.Boolean)])
+    )
+
+    # Now to convert to SOFA
+    v_severe_resp = (pl.col('Blood Gas PaO2') / pl.col('FiO2') < 100) & (pl.col('On ventilation'))
+    severe_resp = (pl.col('Blood Gas PaO2') / pl.col('FiO2') < 200) & (pl.col('On ventilation'))
+    mod_resp = (pl.col('Blood Gas PaO2') / pl.col('FiO2') < 200) & (~pl.col('On ventilation'))
+    mild_resp = pl.col('Blood Gas PaO2') / pl.col('FiO2') < 300
+    v_mild_resp = pl.col('Blood Gas PaO2') / pl.col('FiO2') < 400
+    resp_null = pl.col('Blood Gas PaO2').is_null() | pl.col('FiO2').is_null()
+
+    v_v_low_platelets = pl.col('Platelets') < 20
+    v_low_platelets = pl.col('Platelets') < 50
+    low_platelets = pl.col('Platelets') < 100
+    mild_platelets = pl.col('Platelets') < 150
+    platelets_null = pl.col('Platelets').is_null()
+
+    v_low_GCS = pl.col('GCS') < 6
+    low_GCS = pl.col('GCS') < 10
+    mod_GCS = pl.col('GCS') < 13
+    mild_GCS = pl.col('GCS') < 15
+    GCS_null = pl.col('GCS').is_null()
+
+    v_high_bili = pl.col('Bilirubin') > 204
+    high_bili = pl.col('Bilirubin') >= 102
+    mod_bili = pl.col('Bilirubin') >= 33
+    mild_bili = pl.col('Bilirubin') >= 20
+    bili_null = pl.col('Bilirubin').is_null()
+
+    high_pressors = (pl.col('Dopamine') > 15) | (pl.col('Adrenaline') > 0.1) | (pl.col('Noradrenaline') > 0.1)
+    med_pressors = (pl.col('Dopamine') > 5) | (pl.col('Adrenaline') > 0) | (pl.col('Noradrenaline') > 0)
+    low_pressors = (pl.col('Dopamine') > 0) | (pl.col('Dobutamine') > 0)
+    hypotensive = pl.col('MAP') < 70
+    pressors_null = pl.col('MAP').is_null()
+
+    v_high_cr = pl.col('Creatinine') > 440
+    high_cr = pl.col('Creatinine') >= 300
+    mod_cr = pl.col('Creatinine') >= 171
+    mild_cr = pl.col('Creatinine') >= 110
+    cr_null = pl.col('Creatinine').is_null()
+
+    sofa_score = (
+        sofa_score.with_columns([
+            pl.when(v_severe_resp).then(4).when(severe_resp).then(3).when(mod_resp).then(2).when(mild_resp).then(2)
+            .when(v_mild_resp).then(1).when(resp_null).then(None).otherwise(0).alias('Resp_1'),
+
+            pl.when(v_v_low_platelets).then(4).when(v_low_platelets).then(3).when(low_platelets).then(2)
+            .when(mild_platelets).then(1).when(platelets_null).then(None).otherwise(0).alias('Platelets_2'),
+
+            pl.when(v_low_GCS).then(4).when(low_GCS).then(3).when(mod_GCS).then(2).when(mild_GCS).then(1)
+            .when(GCS_null).then(None).otherwise(0).alias('GCS_3'),
+
+            pl.when(v_high_bili).then(4).when(high_bili).then(3).when(mod_bili).then(2).when(mild_bili).then(1)
+            .when(bili_null).then(None).otherwise(0).alias('Bilirubin_4'),
+
+            pl.when(high_pressors).then(4).when(med_pressors).then(3).when(low_pressors).then(2)
+            .when(hypotensive).then(1).when(pressors_null).then(None).otherwise(0).alias('Pressors_5'),
+
+            pl.when(v_high_cr).then(4).when(high_cr).then(3).when(mod_cr).then(2).when(mild_cr).then(1)
+            .when(cr_null).then(None).otherwise(0).alias('Creatinine_6')
+        ])
+        .select('subject_id', 'starttime', (pl.col('Resp_1') + pl.col('Platelets_2') + pl.col('GCS_3')
+                                            + pl.col('Bilirubin_4') + pl.col('Pressors_5') + pl.col('Creatinine_6')
+                                            ).alias('SOFA'))
+        .filter(pl.col('SOFA').is_not_null())
+        # Standardise to 0-1 range, assuming a minimum SOFA score of 0
+        .with_columns([
+            pl.col('SOFA') / pl.col('SOFA').max()
+        ])
+        .unique()
+    )
+
+    # Join into our labels DF
+    labels = labels.join(sofa_score, left_on=['subject_id', 'labeltime'], right_on=['subject_id', 'starttime'],
+                         how='left')
+
+    # Ditch the vital signs from the combined_data DF
+    combined_data = combined_data.filter(~pl.col('feature').is_in(['FiO2', 'MAP', 'GCS - Eye', 'GCS - Motor',
+                                                                   'GCS - Verbal', 'On ventilation']))
+
+    return labels, combined_data
+
+
 def add_zero_rates(df):
     """
     Rates that are stopped need to be explicitly set to zero.
@@ -564,7 +727,7 @@ def create_final_dataframe(data_option: str, encoded_input_data, labels, encodin
                     # For all our labels, just group these together into a Polars Struct for simplicity
                     pl.struct(
                         pl.col('labeltime_next', '1-day-died', '3-day-died',
-                               '7-day-died', '14-day-died', '28-day-died', 'age', 'gender',
+                               '7-day-died', '14-day-died', '28-day-died', 'SOFA', 'age', 'gender',
                                'patientweight')).alias('targets')
                 ])
                 .collect()
@@ -1313,7 +1476,12 @@ def get_lab_names():
             'Blood Gas pO2', 'Urea', 'Ionised Calcium', 'Calcium', 'CRP', 'Chloride', 'Chloride', 'Creatinine',
             'Glucose', 'Bedside Glucose', 'Bedside Glucose', 'HCO3', 'Haematocrit', 'Haemoglobin', 'Lactate', 'LDH',
             'Lipase', 'pH', 'pH', 'Platelets', 'Potassium', 'Potassium', 'Prothrombin Time', 'Sodium', 'Sodium',
-            'Bilirubin', 'Troponin - T', 'Blood Gas pCO2', 'Blood Gas pO2', 'WBC']
+            'Bilirubin', 'Troponin - T', 'Blood Gas pCO2', 'WBC', #'Blood Gas pO2',
+
+            # Temporary for SOFA!
+            'FiO2', 'GCS - Eye', 'GCS - Motor', 'GCS - Verbal', 'MAP', 'On ventilation', 'Blood Gas PaO2',
+            'Blood Gas PvO2'
+    ]
 
 
 def get_next_label_state(labels, data_group: str, patient_ids, next_state_start, next_state_window=24):
@@ -1541,7 +1709,8 @@ def get_variable_names_for_mimic():
         # Labs
         'ALT': 'ALT', 'AST': 'AST', 'Albumin': 'Albumin', 'Alkaline Phosphate': 'ALP', 'Amylase': 'Amylase',
         'Anion gap': 'Anion Gap', 'Arterial Base Excess': 'Base Excess', 'Arterial CO2 Pressure': 'Blood Gas pCO2',
-        'Arterial O2 Saturation': 'Blood Gas SpO2', 'Arterial O2 pressure': 'Blood Gas pO2',
+        'Arterial O2 Saturation': 'Blood Gas SpO2',  # 'Arterial O2 pressure': 'Blood Gas pO2',
+        'Arterial O2 pressure': 'Blood Gas PaO2',
         'BUN': 'Urea', 'Ionized Calcium': 'Ionised Calcium',
         'Calcium non-ionized': 'Calcium', 'C Reactive Protein (CRP)': 'CRP', 'Chloride (serum)': 'Chloride',
         'Chloride (whole blood)': 'Chloride', 'Creatinine (serum)': 'Creatinine', 'Glucose (serum)': 'Glucose',
@@ -1551,7 +1720,14 @@ def get_variable_names_for_mimic():
         'Platelet Count': 'Platelets', 'Potassium (serum)': 'Potassium', 'Potassium (whole blood)': 'Potassium',
         'Prothrombin time': 'Prothrombin Time', 'Sodium (serum)': 'Sodium', 'Sodium (whole blood)': 'Sodium',
         'Total Bilirubin': 'Bilirubin', 'Troponin-T': 'Troponin - T', 'Venous CO2 Pressure': 'Blood Gas pCO2',
-        'Venous O2 Pressure': 'Blood Gas pO2', 'WBC': 'WBC',
+        #'Venous O2 Pressure': 'Blood Gas pO2',
+        'Venous O2 Pressure': 'Blood Gas PvO2',
+        'WBC': 'WBC',
+
+        # TEMPORARY FOR SOFA VALIDATION
+        'Inspired O2 Fraction': 'FiO2', 'PEEP set': 'On ventilation',
+        'GCS - Eye Opening': 'GCS - Eye', 'GCS - Motor Response': 'GCS - Motor',
+        'GCS - Verbal Response': 'GCS - Verbal', 'Arterial Blood Pressure mean': 'MAP',
     }
 
 
