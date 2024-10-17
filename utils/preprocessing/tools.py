@@ -99,7 +99,7 @@ def add_sofa_to_labels_in_mimic(labels, combined_data):
         | pl.col('Dobutamine').is_not_null() | pl.col('Adrenaline').is_not_null() | pl.col('Noradrenaline').is_not_null())
 
     # Fill in missing patientweight values (as we need to convert our rates to mcg/kg/min)
-    sofa_score = sofa_score.with_columns([
+    sofa_score = sofa_score.sort('subject_id', 'starttime').with_columns([
         pl.col('patientweight')
         .fill_null(strategy='forward')
         .fill_null(strategy='backward')
@@ -125,32 +125,23 @@ def add_sofa_to_labels_in_mimic(labels, combined_data):
     # Use a rolling window to get the "worst" values for the last 24 hours at each timepoint
     sofa_score = (
         sofa_score
-        # Fill nulls so we can get SOFA scores everywhere
+        .sort(by=['subject_id', 'starttime'])
+        # Fill nulls for drugs
         .with_columns([
-            pl.col(feature).fill_null(strategy='forward').over('subject_id')
-            for feature in ['Blood Gas PaO2', 'FiO2', 'MAP', 'GCS', 'On ventilation', 'Platelets', 'Bilirubin',
-                            'Creatinine', 'Dopamine', 'Dobutamine', 'Adrenaline', 'Noradrenaline']
-        ])
-        .with_columns([
-            # pl.col('Blood Gas PaO2').fill_null(value=100),
-            # pl.col('FiO2').fill_null(value=0.21),
-            # pl.col('MAP').fill_null(value=100),
-            # pl.col('GCS').fill_null(value=15),
-            pl.col('On ventilation').fill_null(value=False),
-            # pl.col('Platelets').fill_null(value=200),
-            # pl.col('Bilirubin').fill_null(value=10),
-            # pl.col('Creatinine').fill_null(value=50),
-            # pl.col('Dopamine').fill_null(value=0),
-            # pl.col('Dobutamine').fill_null(value=0),
-            # pl.col('Adrenaline').fill_null(value=0),
-            # pl.col('Noradrenaline').fill_null(value=0)
+            pl.col(feature).fill_null(strategy='forward').fill_null(value=0).over('subject_id')
+            for feature in ['Dopamine', 'Dobutamine', 'Adrenaline', 'Noradrenaline']
         ])
         .rolling(index_column='starttime', period='24h', group_by='subject_id')
         .agg(pl.col('Blood Gas PaO2').min(), pl.col('FiO2').max(), pl.col('MAP').min(), pl.col('GCS').min(),
              pl.col('On ventilation').max(), pl.col('Platelets').min(), pl.col('Bilirubin').max(),
              pl.col('Creatinine').max(), pl.col('Dopamine').max(), pl.col('Dobutamine').max(),
              pl.col('Adrenaline').max(), pl.col('Noradrenaline').max())
-        .with_columns([pl.col('On ventilation').cast(pl.Boolean)])
+        .with_columns([pl.col('On ventilation').cast(pl.Boolean).fill_null(value=False)])
+        # Fill nulls so we can get SOFA scores everywhere
+        # .with_columns([
+            # pl.col(feature).fill_null(strategy='forward').over('subject_id')
+            # for feature in ['Blood Gas PaO2', 'FiO2', 'MAP', 'GCS', 'Platelets', 'Bilirubin', 'Creatinine']
+        # ])
     )
 
     # Now to convert to SOFA
@@ -1728,6 +1719,7 @@ def get_variable_names_for_mimic():
         'Inspired O2 Fraction': 'FiO2', 'PEEP set': 'On ventilation',
         'GCS - Eye Opening': 'GCS - Eye', 'GCS - Motor Response': 'GCS - Motor',
         'GCS - Verbal Response': 'GCS - Verbal', 'Arterial Blood Pressure mean': 'MAP',
+        'Non Invasive Blood Pressure mean': 'MAP',
     }
 
 
