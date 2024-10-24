@@ -77,7 +77,7 @@ def train(train_dataloader, val_dataloader, device, model_type: str, hidden_dim:
     # Create Tensorboard for logging
     log_dir = f"./logs/{current_date}/{model_name}"
     writer = SummaryWriter(log_dir=log_dir)
-    start_tensorboard(log_dir)
+    start_tensorboard()
 
     # Train the model
     model.train()

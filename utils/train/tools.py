@@ -99,8 +99,11 @@ class Dataset(IterableDataset):
 
 def check_valid_files_for_training():
     for segment in ['train', 'val']:
-        if not os.path.isfile(f'./data/mimic/{segment}/h5_array_{segment}.hdf5'):
-            raise FileNotFoundError(f'Missing data/mimic/{segment}/h5_array_{segment}.hdf5 '
+        path = f'./data/mimic/{segment}/'
+        filepath = path + f'h5_array_{segment}.hdf5'
+        dirpath = path + 'binaries'
+        if not os.path.isfile(filepath) and not os.path.isdir(dirpath):
+            raise FileNotFoundError(f'Missing training files '
                                     f'- have you run the convert_to_parquet.py and generate_dataset.py scripts first?')
 
     return
@@ -108,8 +111,11 @@ def check_valid_files_for_training():
 
 def check_valid_files_for_testing():
     for data_option in ['mimic', 'sicdb']:
-        if not os.path.isfile(f'./data/{data_option}/test/h5_array_test.hdf5'):
-            raise FileNotFoundError(f'Missing data/{data_option}/test/h5_array_test.hdf5 '
+        path = f'./data/{data_option}/test/'
+        filepath = path + 'h5_array_test.hdf5'
+        dirpath = path + 'binaries'
+        if not os.path.isfile(filepath) and not os.path.isdir(dirpath):
+            raise FileNotFoundError(f'Missing testing files '
                                     f'- have you run the convert_to_parquet.py and generate_dataset.py scripts first?')
 
     return
@@ -318,7 +324,18 @@ def perform_model_inference_loop(dataloader, training_loop: bool = False, model=
 
 
 def start_tensorboard(logdir='./logs'):
-    subprocess.Popen(['tensorboard', '--logdir', logdir, '--load_fast=false'])
+    # Check if tensorboard is already running
+    try:
+        result = subprocess.run(['pgrep', '-f', 'tensorboa'], stdout=subprocess.PIPE)
+        if result.returncode == 0:
+            return
+
+    except Exception as e:
+        print(f'Error checking Tensorboard processes: {e}')
+
+    logdir = os.path.abspath(logdir)
+        
+    subprocess.Popen(['tensorboard', '--logdir', logdir, '--load_fast=false'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
 
 
 def unpack_scaling_binaries(features):
