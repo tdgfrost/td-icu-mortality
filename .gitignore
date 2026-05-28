@@ -7,4 +7,6 @@ utils/__pycache__
 utils/parquet_conversion/__pycache__
 utils/preprocessing/__pycache__
 models
-logs
+logs# pixi environments
+.pixi/*
+!.pixi/config.toml

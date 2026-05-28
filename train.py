@@ -15,9 +15,19 @@ parser.add_argument('--hidden_dim', type=int,
                     help="Specify the hidden dimension for the model - default is 32", default=32)
 parser.add_argument('--balanced', type=bool,
                     help="Whether to train with balanced cross-entropy", default=False)
+parser.add_argument('--num_models', type=int,
+                    help="Number of models/seeds to train sequentially", default=5)
 
 
-def train(train_dataloader, val_dataloader, device, model_type: str, hidden_dim: int, balanced: bool):
+def train(train_dataloader, val_dataloader, device, model_type: str, hidden_dim: int, balanced: bool, seed: int):
+    # Set random seed for this training run
+    import random
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
     # Define our model class and target label
     if model_type == "TD":
         target_label = "28-day"
@@ -65,12 +75,12 @@ def train(train_dataloader, val_dataloader, device, model_type: str, hidden_dim:
     current_time = now.strftime('%H%M%S')
     current_date = now.strftime('%Y-%m-%d')
     if model_type == "TD":
-        model_name = f"{model_type}-{current_time}"
+        model_name = f"{model_type}-{current_time}-seed-{seed}"
     else:
         if balanced:
-            model_name = f"{model_type}-supervised-balanced-{current_time}"
+            model_name = f"{model_type}-supervised-balanced-{current_time}-seed-{seed}"
         else:
-            model_name = f"{model_type}-supervised-{current_time}"
+            model_name = f"{model_type}-supervised-{current_time}-seed-{seed}"
     checkpoint_dir = f"./models/{current_date}/{model_name}/checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -149,5 +159,12 @@ if __name__ == "__main__":
     # Get all files required for training
     train_data, val_data = get_training_files(batch_size=64, device=args.device)
 
-    # Train
-    train(train_data, val_data, args.device, args.model, args.hidden_dim, args.balanced)
+    # Generate list of seeds from the root seed (42)
+    np.random.seed(42)
+    # Generate unique random seeds
+    seeds = np.random.randint(0, 1000000, size=args.num_models).tolist()
+
+    # Train sequentially for all seeds
+    for run_idx, seed in enumerate(seeds):
+        announce_progress(f"Starting training run {run_idx + 1}/{args.num_models} with seed {seed}")
+        train(train_data, val_data, args.device, args.model, args.hidden_dim, args.balanced, seed)

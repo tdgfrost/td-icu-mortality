@@ -42,7 +42,7 @@ class BCELoss(nn.Module):
 
 
 class Dataset(IterableDataset):
-    def __init__(self, data_option, mode, batch_size: int = 64, device: str = 'cpu', verbose: bool = True):
+    def __init__(self, data_option, mode, batch_size: int = 64, device: str = 'cpu', verbose: bool = True, shuffle: bool = None):
         super(Dataset).__init__()
 
         self.data, self.labels, self.scaling, self.features, self.label_features = load_torch_binaries(data_option,
@@ -53,6 +53,9 @@ class Dataset(IterableDataset):
         self.batch_size = batch_size
         self.n_samples = len(self.labels)
         self.n_features = len(self.features)
+        
+        # Default shuffle to True if mode is 'train', otherwise False
+        self.shuffle = shuffle if shuffle is not None else (mode == 'train')
 
         # For the dataloader - identify number of segments
         self.sample_idxs = np.arange(self.n_samples)
@@ -66,9 +69,13 @@ class Dataset(IterableDataset):
         return iter(self.generate())
 
     def generate(self):
-        idxs = torch.tensor(np.random.choice(self.sample_idxs, size=(self.segments, self.batch_size),
-                                             replace=False),
-                            dtype=torch.long, device='cpu')
+        if self.shuffle:
+            idxs = torch.tensor(np.random.choice(self.sample_idxs, size=(self.segments, self.batch_size),
+                                                 replace=False),
+                                dtype=torch.long, device='cpu')
+        else:
+            idxs = torch.tensor(np.arange(self.size).reshape(self.segments, self.batch_size),
+                                dtype=torch.long, device='cpu')
 
         for _, preload_step in progress_bar(range(0, len(idxs), 100)) \
                 if self.verbose else enumerate(range(0, len(idxs), 100)):
@@ -136,12 +143,18 @@ def choose_model_folder(path):
 
 def fetch_model(model_name, device, hidden_dim: int = 32):
     model_path = f'./models/{model_name}/checkpoints'
-    files_in_path = os.listdir(model_path)
-    if len(files_in_path) == 1:
-        model_file = os.path.join(model_path, files_in_path[0])
-    else:
-        raise ValueError(f'Either no model or more than one file found in {model_path} '
-                         f'- please ensure only one file is present')
+    files_in_path = [f for f in os.listdir(model_path) if f.endswith('.pt')]
+    if not files_in_path:
+        raise ValueError(f'No .pt model found in {model_path}')
+
+    # If there are multiple checkpoints, select the one with the highest epoch number (e.g. epoch_4.pt)
+    if len(files_in_path) > 1:
+        try:
+            files_in_path = sorted(files_in_path, key=lambda x: int(x.split('_')[1].split('.')[0]))
+        except Exception:
+            files_in_path = sorted(files_in_path)
+
+    model_file = os.path.join(model_path, files_in_path[-1])
 
     with open('./data/features.txt', 'r') as f:
         features = f.read().splitlines()
@@ -158,7 +171,30 @@ def fetch_model(model_name, device, hidden_dim: int = 32):
                       num_models=1)[0]
 
     checkpoint = torch.load(model_file, map_location=torch.device('cpu'), weights_only=False)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = checkpoint['model_state_dict']
+
+    # Dynamically translate past model architecture state_dict keys to the new CNNLSTMPredictor layout
+    translated_state_dict = {}
+    for key, val in state_dict.items():
+        new_key = key
+        # Translate old embedding keys to ModuleDict layout
+        if key.startswith("time_embedding."):
+            new_key = key.replace("time_embedding.", "embedding_net.time.")
+        elif key.startswith("value_embedding."):
+            new_key = key.replace("value_embedding.", "embedding_net.value.")
+        elif key.startswith("feature_embedding."):
+            new_key = key.replace("feature_embedding.", "embedding_net.feature.")
+        elif key.startswith("delta_time_embedding."):
+            new_key = key.replace("delta_time_embedding.", "embedding_net.delta_time.")
+        elif key.startswith("delta_value_embedding."):
+            new_key = key.replace("delta_value_embedding.", "embedding_net.delta_value.")
+        # Translate old sequential LSTM keys to direct LSTM layout
+        elif key.startswith("lstm.0."):
+            new_key = key.replace("lstm.0.", "lstm.")
+
+        translated_state_dict[new_key] = val
+
+    model.load_state_dict(translated_state_dict)
 
     return model
 
@@ -245,10 +281,13 @@ def load_torch_binaries(data_option: str, mode: str):
 
 def perform_model_inference_loop(dataloader, training_loop: bool = False, model=None, target_model=None, optimizer=None,
                                  loss_fn=None, balanced: bool = False, target_label=None, metrics=None,
-                                 epoch: int = None):
+                                 epoch: int = None, flip_predictions: bool = False, return_outputs: bool = False):
     # Make metrics are reset
     for day in ['1-day', '3-day', '7-day', '14-day', '28-day']:
         metrics[f'auroc_{day}'].reset()
+
+    all_predictions = []
+    all_targets = {f'{day}-died': [] for day in ['1-day', '3-day', '7-day', '14-day', '28-day']} if return_outputs else None
 
     balanced_weights = None
     for steps, (inputs, targets) in enumerate(dataloader):
@@ -292,10 +331,17 @@ def perform_model_inference_loop(dataloader, training_loop: bool = False, model=
                 # Forward pass
                 predictions, _ = model(inputs['timepoints'], inputs['values'], inputs['features'],
                                        inputs['delta_time'], inputs['delta_value'])
+                if flip_predictions:
+                    predictions = 1.0 - predictions
 
         # Update the running loss and metrics
         for day in ['1-day', '3-day', '7-day', '14-day', '28-day']:
             metrics[f'auroc_{day}'].update(predictions.flatten(), targets[f'{day}-died'].long().flatten())
+
+        if return_outputs:
+            all_predictions.extend(predictions.flatten().cpu().numpy())
+            for day in ['1-day', '3-day', '7-day', '14-day', '28-day']:
+                all_targets[f'{day}-died'].extend(targets[f'{day}-died'].long().flatten().cpu().numpy())
 
         if training_loop:
             if (steps + 1) % 100 == 0:
@@ -320,6 +366,8 @@ def perform_model_inference_loop(dataloader, training_loop: bool = False, model=
         # Print progress
         announce_progress(results_str)
 
+    if not training_loop and return_outputs:
+        return metrics, all_predictions, all_targets
     return metrics
 
 
