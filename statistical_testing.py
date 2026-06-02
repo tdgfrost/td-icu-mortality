@@ -76,7 +76,8 @@ def _compute_single_group_horizon(dataset, group, h, gt, ens_rank, seeds_preds):
     seed_aucs = [compute_auc_score(gt, sp) for sp in seeds_preds]
     
     # Return everything needed to reconstruct the dictionary later
-    return dataset, group, h, ensemble_auc, np.mean(seed_aucs), np.std(seed_aucs)
+    return dataset, group, h, ensemble_auc, np.mean(seed_aucs), np.std(seed_aucs), seed_aucs
+
 
 
 def fastDeLong_no_weights(predictions_sorted_transposed, label_1_count):
@@ -306,11 +307,12 @@ def run_statistical_analysis():
             raw_auroc_results[dataset][group] = {}
 
     for res in results:
-        dataset, group, h, ens_auc, seed_mean, seed_std = res
+        dataset, group, h, ens_auc, seed_mean, seed_std, seed_aucs = res
         raw_auroc_results[dataset][group][h] = {
             "ensemble": ens_auc,
             "seed_mean": seed_mean,
-            "seed_std": seed_std
+            "seed_std": seed_std,
+            "seed_aucs": seed_aucs
         }
 
     # 2. Perform TD vs Supervised comparisons across all horizons
@@ -407,6 +409,28 @@ def run_statistical_analysis():
             )
         report_lines.append("\n")
 
+    # Add Seed-Level Raw AUROC tables at the end of the report
+    report_lines.append("## Detailed Seed-Level Raw AUROC Scores")
+    report_lines.append("Below are the individual seed AUROC scores (one for each of the 5 training seeds) for each model category, target horizon, and dataset.\n")
+
+    for dataset in ["internal", "external"]:
+        report_lines.append(f"### {dataset.upper()} Dataset - Seed-Level Raw AUROC Scores")
+        report_lines.append("| Model Group | Target Horizon | Seed 1 | Seed 2 | Seed 3 | Seed 4 | Seed 5 |")
+        report_lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for group in model_groups_ordered:
+            if group not in raw_auroc_results[dataset]:
+                continue
+            for h in horizons_ordered:
+                metrics = raw_auroc_results[dataset][group][h]
+                seed_vals = metrics["seed_aucs"]
+                # Format to 5 decimal places
+                formatted_seeds = [f"{val:.5f}" for val in seed_vals]
+                # If there are fewer than 5 seeds, pad with N/A
+                while len(formatted_seeds) < 5:
+                    formatted_seeds.append("N/A")
+                report_lines.append(f"| **{group}** | {h} | " + " | ".join(formatted_seeds) + " |")
+        report_lines.append("\n")
+
     report_content = "\n".join(report_lines)
     
     # Save the report
@@ -414,9 +438,33 @@ def run_statistical_analysis():
     with open(report_path, "w") as f:
         f.write(report_content)
     
+    # Save a separate structured JSON of raw seed AUROCs for programmatic usage
+    import json
+    json_results = []
+    for dataset in ["internal", "external"]:
+        for group in model_groups_ordered:
+            if group not in raw_auroc_results[dataset]:
+                continue
+            for h in horizons_ordered:
+                metrics = raw_auroc_results[dataset][group][h]
+                json_results.append({
+                    "dataset": dataset,
+                    "model_group": group,
+                    "target_horizon": h,
+                    "ensemble_auroc": metrics["ensemble"],
+                    "seed_mean_auroc": metrics["seed_mean"],
+                    "seed_std_auroc": metrics["seed_std"],
+                    "seed_aurocs": [float(val) for val in metrics["seed_aucs"]]
+                })
+
+    json_path = os.path.join(results_dir, "seed_level_aurocs.json")
+    with open(json_path, "w") as f:
+        json.dump(json_results, f, indent=4)
+    
     print("\n" + "="*50)
     print("Statistical Testing Completed successfully!")
     print(f"Report written to: {report_path}")
+    print(f"Structured JSON written to: {json_path}")
     print("="*50)
     print(report_content)
 
