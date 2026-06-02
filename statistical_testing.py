@@ -17,8 +17,11 @@ import polars as pl
 import scipy.stats
 from scipy import stats
 import datetime
+import numba
+from tqdm import tqdm
+from joblib import Parallel, delayed
 
-
+@numba.njit(cache=True)
 def compute_midrank(x):
     """Computes midranks to handle tied prediction values.
     Args:
@@ -29,7 +32,7 @@ def compute_midrank(x):
     J = np.argsort(x)
     Z = x[J]
     N = len(x)
-    T = np.zeros(N, dtype=float)
+    T = np.zeros(N, dtype=numba.float64)
     i = 0
     while i < N:
         j = i
@@ -37,9 +40,44 @@ def compute_midrank(x):
             j += 1
         T[i:j] = 0.5 * (i + j - 1)
         i = j
-    T2 = np.empty(N, dtype=float)
+    T2 = np.empty(N, dtype=numba.float64)
     T2[J] = T + 1
     return T2
+
+@numba.njit(cache=True)
+def compute_auc_score(gt, preds):
+    n = len(gt)
+    n_pos = np.sum(gt)
+    n_neg = n - n_pos
+    
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    # Re-use our fast Numba midrank function!
+    ranks = compute_midrank(preds)
+    
+    # Sum the ranks of the positive class
+    pos_ranks_sum = 0.0
+    for i in range(n):
+        if gt[i] == 1:
+            pos_ranks_sum += ranks[i]
+            
+    # Calculate AUROC directly via the U-statistic formula
+    u_stat = pos_ranks_sum - (n_pos * (n_pos + 1.0)) / 2.0
+    return u_stat / (n_pos * n_neg)
+
+
+def _compute_single_group_horizon(dataset, group, h, gt, ens_rank, seeds_preds):
+    """Worker function for parallel AUROC calculation."""
+    # 1. Calculate ensemble AUC
+    ensemble_auc = compute_auc_score(gt, ens_rank)
+    
+    # 2. Calculate individual seed AUCs
+    seed_aucs = [compute_auc_score(gt, sp) for sp in seeds_preds]
+    
+    # Return everything needed to reconstruct the dictionary later
+    return dataset, group, h, ensemble_auc, np.mean(seed_aucs), np.std(seed_aucs)
+
 
 def fastDeLong_no_weights(predictions_sorted_transposed, label_1_count):
     """
@@ -68,11 +106,13 @@ def fastDeLong_no_weights(predictions_sorted_transposed, label_1_count):
     delongcov = sx / m + sy / n
     return aucs, delongcov
 
+
 def compute_ground_truth_statistics(ground_truth):
     assert np.array_equal(np.unique(ground_truth), [0, 1]) or np.array_equal(np.unique(ground_truth), [0]) or np.array_equal(np.unique(ground_truth), [1])
     order = (-ground_truth).argsort()
     label_1_count = int(ground_truth.sum())
     return order, label_1_count
+
 
 def delong_roc_test(ground_truth, predictions_one, predictions_two):
     """
@@ -97,6 +137,7 @@ def delong_roc_test(ground_truth, predictions_one, predictions_two):
     
     return aucs[0], aucs[1], p_value
 
+
 def compute_fractional_ranks(predictions):
     """
     Converts probabilistic predictions to fractional ranks (0-1) across the dataset.
@@ -107,6 +148,7 @@ def compute_fractional_ranks(predictions):
         return np.zeros_like(predictions)
     ranks = scipy.stats.rankdata(predictions, method='average')
     return (ranks - 1.0) / (n - 1.0)
+
 
 def get_model_group(filename):
     """
@@ -125,6 +167,7 @@ def get_model_group(filename):
             else:
                 return day
     return None
+
 
 def benjamini_hochberg_correction(p_values):
     """
@@ -148,6 +191,7 @@ def benjamini_hochberg_correction(p_values):
         
     original_idx = np.argsort(sort_idx)
     return adjusted_p[original_idx]
+
 
 def run_statistical_analysis():
     results_dir = "./evaluation_results"
@@ -183,113 +227,182 @@ def run_statistical_analysis():
         for group, files in sorted(groups[dataset].items()):
             print(f"    - Group '{group}': {len(files)} seed models (files)")
 
+    # Load all predictions and labels
+    loaded_data = {"internal": {}, "external": {}}
+    labels = {"internal": None, "external": None}
+    
+    for dataset in ["internal", "external"]:
+        for group, files in sorted(groups[dataset].items()):
+            seeds_predictions = []
+            seeds_ranks = []
+            for file in files:
+                df = pl.read_csv(file).sort("sample_idx")
+                n = df.height
+                if n > 1:
+                    df = df.with_columns(
+                        ((pl.col("prediction").rank(method="average") - 1.0) / (n - 1.0)).alias("frac_rank")
+                    )
+                else:
+                    df = df.with_columns(pl.lit(0.0).alias("frac_rank"))
+
+                pred = df["prediction"].to_numpy()
+                frac_rank = df["frac_rank"].to_numpy()
+                seeds_predictions.append(pred)
+                seeds_ranks.append(frac_rank)
+                
+                if labels[dataset] is None:
+                    labels[dataset] = {
+                        "label_1d": df["label_1d"].to_numpy(),
+                        "label_3d": df["label_3d"].to_numpy(),
+                        "label_7d": df["label_7d"].to_numpy(),
+                        "label_14d": df["label_14d"].to_numpy(),
+                        "label_28d": df["label_28d"].to_numpy()
+                    }
+            
+            ensemble_rank = np.mean(seeds_ranks, axis=0)
+            
+            if dataset not in loaded_data:
+                loaded_data[dataset] = {}
+            loaded_data[dataset][group] = {
+                "seeds_predictions": seeds_predictions,
+                "seeds_ranks": seeds_ranks,
+                "ensemble_rank": ensemble_rank
+            }
+
+    # Define strict ordering for groups and horizons
+    model_groups_ordered = ["TD", "1d", "1d+", "3d", "3d+", "7d", "7d+", "14d", "14d+", "28d", "28d+"]
+    horizons_ordered = ["1d", "3d", "7d", "14d", "28d"]
+
+    # 1. Compute raw AUROCs for each model on each horizon
+    print("Preparing parallel AUROC tasks...")
+    tasks = []
+    
+    # Step A: Flatten the nested loops into a list of standalone tasks
+    for dataset in ["internal", "external"]:
+        for group in model_groups_ordered:
+            if group not in loaded_data[dataset]:
+                continue
+            for h in horizons_ordered:
+                gt = labels[dataset][f"label_{h}"]
+                ens_rank = loaded_data[dataset][group]["ensemble_rank"]
+                seeds_preds = loaded_data[dataset][group]["seeds_predictions"]
+                
+                # Append the raw data needed for this specific combination
+                tasks.append((dataset, group, h, gt, ens_rank, seeds_preds))
+
+    # Step B: Execute all tasks in parallel across all CPU cores
+    print(f"Executing {len(tasks)} tasks across multiple cores...")
+    # n_jobs=-1 tells Joblib to use all available CPU cores
+    results = Parallel(n_jobs=-1, backend="loky")(
+        delayed(_compute_single_group_horizon)(*task) 
+        for task in tqdm(tasks, desc="Calculating AUROCs")
+    )
+
+    # Step C: Reassemble the results back into your nested dictionary format
+    raw_auroc_results = {"internal": {}, "external": {}}
+    for dataset in ["internal", "external"]:
+        raw_auroc_results[dataset] = {}
+        for group in model_groups_ordered:
+            raw_auroc_results[dataset][group] = {}
+
+    for res in results:
+        dataset, group, h, ens_auc, seed_mean, seed_std = res
+        raw_auroc_results[dataset][group][h] = {
+            "ensemble": ens_auc,
+            "seed_mean": seed_mean,
+            "seed_std": seed_std
+        }
+
+    # 2. Perform TD vs Supervised comparisons across all horizons
+    all_tests = []
+    for dataset in ["internal", "external"]:
+        if "TD" not in loaded_data[dataset]:
+            print(f"Warning: No TD models found for {dataset} dataset. Skipping comparisons.")
+            continue
+        
+        td_ensemble = loaded_data[dataset]["TD"]["ensemble_rank"]
+        
+        for h in tqdm(horizons_ordered, desc=f"Running DeLong Tests ({dataset})"):
+            gt = labels[dataset][f"label_{h}"]
+            
+            for group in model_groups_ordered:
+                if group == "TD" or group not in loaded_data[dataset]:
+                    continue
+                
+                group_ensemble = loaded_data[dataset][group]["ensemble_rank"]
+                
+                # Perform DeLong's test
+                try:
+                    auc_td, auc_group, p_val = delong_roc_test(gt, td_ensemble, group_ensemble)
+                    all_tests.append({
+                        "dataset": dataset,
+                        "target": h,
+                        "comparison": f"TD vs {group}",
+                        "auc_td": auc_td,
+                        "auc_supervised": auc_group,
+                        "p_value": p_val
+                    })
+                except Exception as e:
+                    print(f"Error performing DeLong's test for {dataset} {group} on {h}: {e}")
+
+    # Apply BH correction globally
+    if all_tests:
+        p_values = [t["p_value"] for t in all_tests]
+        adj_p_values = benjamini_hochberg_correction(p_values)
+        for idx, adj_p in enumerate(adj_p_values):
+            all_tests[idx]["adj_p_value"] = adj_p
+
+    # Format the report
     report_lines = []
     report_lines.append("# Statistical Testing and Model Comparison Report")
     report_lines.append(f"Generated on: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
     report_lines.append("## Methodology Summary")
     report_lines.append("1. **Fractional Ranks**: For each seed model and dataset, probabilistic predictions were converted to fractional ranks (0-1) across the dataset, handling ties using the average rank method.")
     report_lines.append("2. **Rank-Averaged Ensemble**: Fractional ranks were averaged across all available seeds for each model group to construct a stable ensembled prediction score.")
-    report_lines.append("3. **DeLong's Test**: The ensembled TD model group was compared directly to each available supervised model group (both standard and balanced `+` models) on the corresponding mortality target label using DeLong's test for correlated ROC curves.")
-    report_lines.append("4. **FDR Control**: P-values across all tests were corrected globally using the Benjamini-Hochberg procedure.\n")
+    report_lines.append("3. **Cross-Horizon Evaluation**: All model groups (both TD and supervised model categories) were evaluated across every target mortality horizon label (1, 3, 7, 14, and 28 day mortality).")
+    report_lines.append("4. **DeLong's Test**: The ensembled TD model group was compared directly to each supervised model group (both standard and balanced `+` models) for every target mortality horizon using DeLong's test for correlated ROC curves.")
+    report_lines.append("5. **FDR Control**: P-values across all tests were corrected globally using the Benjamini-Hochberg procedure.\n")
 
-    # Define target label mapping for DeLong comparison
-    target_mapping = {
-        "1d": "label_1d",
-        "1d+": "label_1d",
-        "3d": "label_3d",
-        "3d+": "label_3d",
-        "7d": "label_7d",
-        "7d+": "label_7d",
-        "14d": "label_14d",
-        "14d+": "label_14d",
-        "28d": "label_28d",
-        "28d+": "label_28d"
-    }
+    # Add Raw AUROC tables first
+    report_lines.append("## Raw AUROC Performance by Model and Horizon")
+    report_lines.append("Values are displayed as **Ensemble AUROC (Seed Mean ± SD)** across the 5 training seeds.\n")
 
-    all_tests = []
-    
     for dataset in ["internal", "external"]:
-        td_files = groups[dataset].get("TD", [])
-        if not td_files:
-            print(f"Warning: No TD models found for {dataset} dataset. Skipping TD comparisons.")
-            continue
-        
-        # Build TD ensembled predictions
-        td_ranks = []
-        td_labels = None
-        for file in td_files:
-            df = pl.read_csv(file).sort("sample_idx")
-            td_ranks.append(compute_fractional_ranks(df["prediction"].to_numpy()))
-            if td_labels is None:
-                # Keep all label columns
-                td_labels = {
-                    "label_1d": df["label_1d"].to_numpy(),
-                    "label_3d": df["label_3d"].to_numpy(),
-                    "label_7d": df["label_7d"].to_numpy(),
-                    "label_14d": df["label_14d"].to_numpy(),
-                    "label_28d": df["label_28d"].to_numpy()
-                }
-        td_ensemble = np.mean(td_ranks, axis=0)
-
-        # Loop through other model groups and compare
-        for group, files in sorted(groups[dataset].items()):
-            if group == "TD":
+        report_lines.append(f"### {dataset.upper()} Dataset - Raw AUROC Scores")
+        report_lines.append("| Model Group | 1d Mortality | 3d Mortality | 7d Mortality | 14d Mortality | 28d Mortality |")
+        report_lines.append("| --- | --- | --- | --- | --- | --- |")
+        for group in model_groups_ordered:
+            if group not in raw_auroc_results[dataset]:
                 continue
-            
-            # Identify corresponding label
-            label_col = target_mapping.get(group)
-            if not label_col or label_col not in td_labels:
-                print(f"Warning: Could not resolve target label for group '{group}'. Skipping.")
-                continue
-            
-            # Build group ensembled predictions
-            group_ranks = []
-            for file in files:
-                df = pl.read_csv(file).sort("sample_idx")
-                group_ranks.append(compute_fractional_ranks(df["prediction"].to_numpy()))
-            group_ensemble = np.mean(group_ranks, axis=0)
+            cells = []
+            for h in horizons_ordered:
+                metrics = raw_auroc_results[dataset][group][h]
+                cells.append(f"{metrics['ensemble']:.5f} ({metrics['seed_mean']:.5f} ± {metrics['seed_std']:.5f})")
+            report_lines.append(f"| **{group}** | " + " | ".join(cells) + " |")
+        report_lines.append("\n")
 
-            # Get target ground truth labels
-            ground_truth = td_labels[label_col]
+    # Add Statistical Comparisons tables
+    report_lines.append("## Statistical Comparisons (TD vs. Supervised Models)")
+    report_lines.append("DeLong's test was conducted for every target horizon comparing the TD ensemble against each supervised ensemble model. P-values were adjusted globally for multiple comparisons using the Benjamini-Hochberg procedure.\n")
 
-            # Perform DeLong's test
-            try:
-                auc_td, auc_group, p_val = delong_roc_test(ground_truth, td_ensemble, group_ensemble)
-                all_tests.append({
-                    "dataset": dataset,
-                    "target": label_col.replace("label_", ""),
-                    "comparison": f"TD vs {group}",
-                    "auc_td": auc_td,
-                    "auc_supervised": auc_group,
-                    "p_value": p_val
-                })
-            except Exception as e:
-                print(f"Error performing DeLong's test for {dataset} '{group}': {e}")
-
-    if not all_tests:
-        print("No valid statistical comparisons were performed.")
-        return
-
-    # Apply BH correction globally
-    p_values = [t["p_value"] for t in all_tests]
-    adj_p_values = benjamini_hochberg_correction(p_values)
-    for idx, adj_p in enumerate(adj_p_values):
-        all_tests[idx]["adj_p_value"] = adj_p
-
-    # Format and save report
     for dataset in ["internal", "external"]:
         dataset_tests = [t for t in all_tests if t["dataset"] == dataset]
         if not dataset_tests:
             continue
         
-        report_lines.append(f"## {dataset.upper()} Dataset Comparisons")
-        report_lines.append("| Target Horizon | Comparison | TD Ensemble AUC | Supervised Ensemble AUC | Raw p-value | Adjusted p-value (BH) | Significance (α=0.05) |")
-        report_lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        # Sort tests to group by target horizon first
+        dataset_tests_sorted = sorted(dataset_tests, key=lambda x: (horizons_ordered.index(x["target"]), x["comparison"]))
+
+        report_lines.append(f"### {dataset.upper()} Dataset - DeLong Comparison Tests")
+        report_lines.append("| Target Horizon | Comparison | TD Ensemble AUC | Supervised Ensemble AUC | Difference | Raw p-value | Adjusted p-value (BH) | Significance (α=0.05) |")
+        report_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
         
-        for t in dataset_tests:
+        for t in dataset_tests_sorted:
             sig = "★ Significant" if t["adj_p_value"] < 0.05 else "Not Significant"
+            diff = t["auc_td"] - t["auc_supervised"]
+            sign_char = "+" if diff >= 0 else ""
             report_lines.append(
-                f"| {t['target']} | {t['comparison']} | {t['auc_td']:.5f} | {t['auc_supervised']:.5f} | "
+                f"| {t['target']} | {t['comparison']} | {t['auc_td']:.5f} | {t['auc_supervised']:.5f} | {sign_char}{diff:.5f} | "
                 f"{t['p_value']:.2g} | {t['adj_p_value']:.2g} | {sig} |"
             )
         report_lines.append("\n")
