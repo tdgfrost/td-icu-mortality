@@ -15,13 +15,12 @@ import glob
 import numpy as np
 import polars as pl
 import scipy.stats
-from scipy import stats
 import datetime
 import numba
 from tqdm import tqdm
 from joblib import Parallel, delayed
 
-@numba.njit(cache=True)
+@numba.njit(cache=True, fastmath=True, nogil=True)
 def compute_midrank(x):
     """Computes midranks to handle tied prediction values.
     Args:
@@ -44,7 +43,7 @@ def compute_midrank(x):
     T2[J] = T + 1
     return T2
 
-@numba.njit(cache=True)
+@numba.njit(cache=True, fastmath=True, nogil=True)
 def compute_auc_score(gt, preds):
     n = len(gt)
     n_pos = np.sum(gt)
@@ -66,22 +65,20 @@ def compute_auc_score(gt, preds):
     u_stat = pos_ranks_sum - (n_pos * (n_pos + 1.0)) / 2.0
     return u_stat / (n_pos * n_neg)
 
-@numba.njit(cache=True, fastmath=True)
-def compute_auprc_score(gt, preds):
+@numba.njit(cache=True, fastmath=True, nogil=True)
+def compute_inverted_auprc_score(gt, preds, total_pos):
+    """
+    Computes AUPRC treating 0 as the positive class.
+    Avoids O(N) array allocations for (1 - gt) and (1.0 - preds).
+    """
     n = len(gt)
-    
-    # OPTIMIZATION 1: Avoid creating the `-preds` temporary array
-    order = np.argsort(preds)[::-1]
-    
-    # OPTIMIZATION 2: Calculate total_pos in a simple loop (often faster in Numba than np.sum)
-    total_pos = 0.0
-    for i in range(n):
-        if gt[i] == 1:
-            total_pos += 1.0
-            
     if total_pos == 0.0:
         return 0.0
         
+    # OPTIMIZATION: Sorting `preds` ascending is equivalent to 
+    # sorting `(1.0 - preds)` descending. Avoids `[::-1]` and array math.
+    order = np.argsort(preds)
+    
     tp = 0.0
     fp = 0.0
     auprc = 0.0
@@ -93,12 +90,11 @@ def compute_auprc_score(gt, preds):
         block_tp = 0.0
         block_fp = 0.0
         
-        # OPTIMIZATION 3: Cache the current score to avoid repeated array lookups in the while-loop
         current_score = preds[order[i]]
         
-        # OPTIMIZATION 4: Index directly using `order` instead of allocating y_true and y_score
         while j < n and preds[order[j]] == current_score:
-            if gt[order[j]] == 1:
+            # OPTIMIZATION: Check for 0 directly instead of 1 - gt
+            if gt[order[j]] == 0:
                 block_tp += 1.0
             else:
                 block_fp += 1.0
@@ -123,17 +119,19 @@ def _compute_single_group_horizon(dataset, group, h, gt, ens_rank, seeds_preds):
     # 1. Calculate ensemble metrics
     ensemble_auc = compute_auc_score(gt, ens_rank)
     # Flip labels and predictions for AUPRC so minority class (death=0) becomes the positive class (1)
-    ensemble_auprc = compute_auprc_score(1 - gt, 1.0 - ens_rank)
+    # ensemble_auprc = compute_auprc_score(1 - gt, 1.0 - ens_rank)
+    # Pass `float(n - np.sum(gt))` as the total_pos argument
+    n = float(len(gt) - np.sum(gt))
+    ensemble_auprc = compute_inverted_auprc_score(gt, ens_rank, n)
     
     # 2. Calculate individual seed metrics
     seed_aucs = [compute_auc_score(gt, sp) for sp in seeds_preds]
-    seed_auprcs = [compute_auprc_score(1 - gt, 1.0 - sp) for sp in seeds_preds]
+    seed_auprcs = [compute_inverted_auprc_score(gt, sp, n) for sp in seeds_preds]
     
     # Return everything needed to reconstruct the dictionary later
     return (dataset, group, h, 
             ensemble_auc, np.mean(seed_aucs), np.std(seed_aucs), seed_aucs,
             ensemble_auprc, np.mean(seed_auprcs), np.std(seed_auprcs), seed_auprcs)
-
 
 
 def fastDeLong_no_weights(predictions_sorted_transposed, label_1_count):
@@ -195,29 +193,34 @@ def delong_roc_test(ground_truth, predictions_one, predictions_two):
     
     return aucs[0], aucs[1], p_value
 
-def _compute_single_bootstrap(dataset, group, h, gt, preds_td, preds_sup, seed, bootstrap_index):
-    # Set a deterministic seed based on both the dataset/horizon seed and the bootstrap index
-    np.random.seed((seed + bootstrap_index) % (2**32))
+def _compute_horizon_bootstrap_iteration(dataset, h, gt, preds_td, preds_sup_dict, seed, bootstrap_index):
+    rng = np.random.RandomState((seed + bootstrap_index) % (2**32))
     
     pos_idx = np.where(gt == 1)[0]
     neg_idx = np.where(gt == 0)[0]
     n_pos = len(pos_idx)
     n_neg = len(neg_idx)
 
-    boot_pos = np.random.choice(pos_idx, size=n_pos, replace=True)
-    boot_neg = np.random.choice(neg_idx, size=n_neg, replace=True)
+    boot_pos = rng.choice(pos_idx, size=n_pos, replace=True)
+    boot_neg = rng.choice(neg_idx, size=n_neg, replace=True)
     idx = np.concatenate((boot_pos, boot_neg))
     
     gt_boot = gt[idx]
     preds_td_boot = preds_td[idx]
-    preds_sup_boot = preds_sup[idx]
     
-    # Flip labels and predictions for AUPRC so minority class (death=0) becomes the positive class (1)
-    auprc_td = compute_auprc_score(1 - gt_boot, 1.0 - preds_td_boot)
-    auprc_sup = compute_auprc_score(1 - gt_boot, 1.0 - preds_sup_boot)
-    delta = auprc_td - auprc_sup
-        
-    return dataset, group, h, delta
+    # Because of stratification, the number of "0" labels is ALWAYS n_neg.
+    total_pos_inverted = float(n_neg)
+    
+    # Pass arrays directly without allocating inverted copies
+    auprc_td = compute_inverted_auprc_score(gt_boot, preds_td_boot, total_pos_inverted)
+    
+    deltas = {}
+    for group, preds_sup in preds_sup_dict.items():
+        preds_sup_boot = preds_sup[idx]
+        auprc_sup = compute_inverted_auprc_score(gt_boot, preds_sup_boot, total_pos_inverted)
+        deltas[group] = auprc_td - auprc_sup
+
+    return dataset, h, bootstrap_index, deltas
 
 
 def compute_fractional_ranks(predictions):
@@ -385,7 +388,7 @@ def run_statistical_analysis():
     # Step B: Execute all tasks in parallel across all CPU cores
     print(f"Executing {len(tasks)} tasks across multiple cores...")
     # n_jobs=-1 tells Joblib to use all available CPU cores
-    results = Parallel(n_jobs=-1, backend="loky")(
+    results = Parallel(n_jobs=-1, backend="threading")(
         delayed(_compute_single_group_horizon)(*task) 
         for task in tqdm(tasks, desc="Calculating AUROCs")
     )
@@ -432,19 +435,17 @@ def run_statistical_analysis():
             # Create a deterministic integer seed for this dataset+horizon combination
             seed = hash(f"{dataset}_{h}") % (2**32)
             
+            preds_sup_dict = {}
             for group in model_groups_ordered:
                 if group == "TD" or group not in loaded_data[dataset]:
                     continue
                 
                 group_ensemble = loaded_data[dataset][group]["ensemble_rank"]
+                preds_sup_dict[group] = group_ensemble
                 
                 # Perform DeLong's test
                 try:
                     auc_td, auc_group, p_val = delong_roc_test(gt, td_ensemble, group_ensemble)
-                    
-                    # Queue individual bootstrap tasks
-                    for i in range(n_bootstraps):
-                        bootstrap_tasks.append((dataset, group, h, gt, td_ensemble, group_ensemble, seed, i))
                     
                     all_tests.append({
                         "dataset": dataset,
@@ -460,6 +461,11 @@ def run_statistical_analysis():
                     })
                 except Exception as e:
                     print(f"Error performing DeLong's test for {dataset} {group} on {h}: {e}")
+                    
+            if preds_sup_dict:
+                # Queue individual bootstrap tasks for this horizon
+                for i in range(n_bootstraps):
+                    bootstrap_tasks.append((dataset, h, gt, td_ensemble, preds_sup_dict, seed, i))
 
     # Apply BY correction globally for DeLong's AUROC p-values
     if all_tests:
@@ -470,23 +476,24 @@ def run_statistical_analysis():
 
     # Execute Bootstraps
     # n_jobs=-1 means using all available cores.
-    max_workers = os.cpu_count() // 2
+    max_workers = max(os.cpu_count() // 2 - 2, 1)
     print(f"Executing {len(bootstrap_tasks)} AUPRC bootstrap tasks across {max_workers} cores...")
     
     # Let Joblib batch these natively to reduce overhead
-    bootstrap_results_raw = Parallel(n_jobs=max_workers, backend="loky", batch_size="auto")(
-        delayed(_compute_single_bootstrap)(*task) 
+    bootstrap_results_raw = Parallel(n_jobs=max_workers, backend="threading", batch_size="auto")(
+        delayed(_compute_horizon_bootstrap_iteration)(*task) 
         for task in tqdm(bootstrap_tasks, desc="Bootstrapping AUPRC")
     )
     
     # Group results back by dataset, group, and horizon
     bootstrap_results = {}
     for res in bootstrap_results_raw:
-        dataset, group, h, delta = res
-        key = (dataset, group, h)
-        if key not in bootstrap_results:
-            bootstrap_results[key] = []
-        bootstrap_results[key].append(delta)
+        dataset, h, bootstrap_index, deltas = res
+        for group, delta in deltas.items():
+            key = (dataset, group, h)
+            if key not in bootstrap_results:
+                bootstrap_results[key] = []
+            bootstrap_results[key].append(delta)
         
     # Process bootstrap results using Benjamini-Yekutieli FCR adjustment
     m = len(bootstrap_results)
