@@ -31,26 +31,26 @@ pdf_vals = kde(x_eval) * 2
 cdf_vals = np.array([np.mean(data <= x) for x in x_eval])
 
 # --- 3. Publication-Quality Styling ---
-# --- 3. Publication-Quality Styling ---
 plt.rcParams.update({
     'font.family': 'sans-serif',
     'font.sans-serif': ['Helvetica', 'Arial', 'DejaVu Sans'],
-    'axes.edgecolor': '#94a3b8',  # Muted slate borders
-    'axes.linewidth': 1.0,
-    'xtick.color': '#334155',
-    'ytick.color': '#334155',
-    'text.color': '#1e293b'
+    'axes.edgecolor': '#000000',   # Pure black borders
+    'axes.labelcolor': '#000000',  # Pure black axis labels
+    'xtick.color': '#000000',      # Pure black x-ticks
+    'ytick.color': '#000000',      # Pure black y-ticks
+    'text.color': '#000000'        # Pure black text (legend, etc.)
 })
 
 fig, ax1 = plt.subplots(figsize=(6, 4), dpi=600)
 
-# Colors: Unified academic navy palette
-primary_color = '#1e3d59'
+# Colors: Professional lighter steel blue for the data curves
+pdf_color = '#756bb1'
+cdf_color = '#bcbddc'
 
 # --- Plot PDF (Left Axis) ---
-line_pdf, = ax1.plot(x_eval, pdf_vals, color=primary_color, linewidth=2.2, label='PDF')
-ax1.set_xlabel('Hours Until Next State', fontsize=12, fontweight='bold', labelpad=12)
-ax1.set_ylabel('Density Estimate (PDF)', fontsize=12, fontweight='bold', labelpad=12, color=primary_color)
+line_pdf, = ax1.plot(x_eval, pdf_vals, color=pdf_color, linewidth=2.2, label='PDF')
+ax1.set_xlabel('Hours Until Next State', fontsize=12, fontweight='bold', labelpad=8)
+ax1.set_ylabel('Density Estimate (PDF)', fontsize=12, fontweight='bold', labelpad=11)
 ax1.tick_params(axis='both', labelsize=10)
 ax1.set_xlim(24, 36)
 ax1.set_ylim(0, max(pdf_vals) * 1.05)
@@ -60,8 +60,8 @@ ax1.grid(True, linestyle='--', alpha=0.4, color='#cbd5e1')
 
 # --- Plot CDF (Right Axis) ---
 ax2 = ax1.twinx()
-line_cdf, = ax2.plot(x_eval, cdf_vals, color=primary_color, linewidth=2.0, linestyle='--', label='CDF')
-ax2.set_ylabel('Cumulative Proportion (CDF)', fontsize=12, fontweight='bold', labelpad=12, color=primary_color)
+line_cdf, = ax2.plot(x_eval, cdf_vals, color=cdf_color, linewidth=2.0, linestyle='--', label='CDF')
+ax2.set_ylabel('Cumulative Proportion (CDF)', fontsize=12, fontweight='bold', labelpad=11)
 ax2.tick_params(axis='y', labelsize=10)
 ax2.set_ylim(0, 1.02)
 ax2.grid(False)  # Keeps the background clean
@@ -75,7 +75,6 @@ ax1.legend(lines, labels, loc='upper right', bbox_to_anchor=(0.92, 0.85),
 plt.tight_layout()
 
 # --- 4. Exports ---
-# Always use PDF for LaTeX documents to ensure infinitely scalable vector graphics
 os.makedirs('./figures', exist_ok=True)
-plt.savefig('./figures/state_time_distribution_thesis.pdf', format='pdf', dpi=600, bbox_inches='tight')
+plt.savefig('./figures/state_interval_distribution.pdf', format='pdf', dpi=600, bbox_inches='tight')
 plt.show()

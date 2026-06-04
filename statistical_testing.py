@@ -7,7 +7,7 @@ Created on May 28, 2026
 Statistical testing comparing the ensembled TD model group against each
 supervised learning model group (standard and balanced "+") for each mortality target.
 Averages fractional ranks across five seeds, runs DeLong's test, and applies
-the Benjamini-Hochberg procedure for multiple testing correction.
+the Benjamini-Yekutieli procedure for multiple testing correction.
 """
 
 import os
@@ -66,17 +66,73 @@ def compute_auc_score(gt, preds):
     u_stat = pos_ranks_sum - (n_pos * (n_pos + 1.0)) / 2.0
     return u_stat / (n_pos * n_neg)
 
+@numba.njit(cache=True, fastmath=True)
+def compute_auprc_score(gt, preds):
+    n = len(gt)
+    
+    # OPTIMIZATION 1: Avoid creating the `-preds` temporary array
+    order = np.argsort(preds)[::-1]
+    
+    # OPTIMIZATION 2: Calculate total_pos in a simple loop (often faster in Numba than np.sum)
+    total_pos = 0.0
+    for i in range(n):
+        if gt[i] == 1:
+            total_pos += 1.0
+            
+    if total_pos == 0.0:
+        return 0.0
+        
+    tp = 0.0
+    fp = 0.0
+    auprc = 0.0
+    prev_recall = 0.0
+    
+    i = 0
+    while i < n:
+        j = i
+        block_tp = 0.0
+        block_fp = 0.0
+        
+        # OPTIMIZATION 3: Cache the current score to avoid repeated array lookups in the while-loop
+        current_score = preds[order[i]]
+        
+        # OPTIMIZATION 4: Index directly using `order` instead of allocating y_true and y_score
+        while j < n and preds[order[j]] == current_score:
+            if gt[order[j]] == 1:
+                block_tp += 1.0
+            else:
+                block_fp += 1.0
+            j += 1
+            
+        tp += block_tp
+        fp += block_fp
+        
+        recall = tp / total_pos
+        precision = tp / (tp + fp) if (tp + fp) > 0.0 else 0.0
+        
+        recall_diff = recall - prev_recall
+        auprc += recall_diff * precision
+        
+        prev_recall = recall
+        i = j
+        
+    return auprc
 
 def _compute_single_group_horizon(dataset, group, h, gt, ens_rank, seeds_preds):
-    """Worker function for parallel AUROC calculation."""
-    # 1. Calculate ensemble AUC
+    """Worker function for parallel AUROC and AUPRC calculation."""
+    # 1. Calculate ensemble metrics
     ensemble_auc = compute_auc_score(gt, ens_rank)
+    # Flip labels and predictions for AUPRC so minority class (death=0) becomes the positive class (1)
+    ensemble_auprc = compute_auprc_score(1 - gt, 1.0 - ens_rank)
     
-    # 2. Calculate individual seed AUCs
+    # 2. Calculate individual seed metrics
     seed_aucs = [compute_auc_score(gt, sp) for sp in seeds_preds]
+    seed_auprcs = [compute_auprc_score(1 - gt, 1.0 - sp) for sp in seeds_preds]
     
     # Return everything needed to reconstruct the dictionary later
-    return dataset, group, h, ensemble_auc, np.mean(seed_aucs), np.std(seed_aucs), seed_aucs
+    return (dataset, group, h, 
+            ensemble_auc, np.mean(seed_aucs), np.std(seed_aucs), seed_aucs,
+            ensemble_auprc, np.mean(seed_auprcs), np.std(seed_auprcs), seed_auprcs)
 
 
 
@@ -136,7 +192,32 @@ def delong_roc_test(ground_truth, predictions_one, predictions_two):
     z = np.abs(aucs[0] - aucs[1]) / np.sqrt(variance)
     p_value = 2 * scipy.stats.norm.sf(z)
     
+    
     return aucs[0], aucs[1], p_value
+
+def _compute_single_bootstrap(dataset, group, h, gt, preds_td, preds_sup, seed, bootstrap_index):
+    # Set a deterministic seed based on both the dataset/horizon seed and the bootstrap index
+    np.random.seed((seed + bootstrap_index) % (2**32))
+    
+    pos_idx = np.where(gt == 1)[0]
+    neg_idx = np.where(gt == 0)[0]
+    n_pos = len(pos_idx)
+    n_neg = len(neg_idx)
+
+    boot_pos = np.random.choice(pos_idx, size=n_pos, replace=True)
+    boot_neg = np.random.choice(neg_idx, size=n_neg, replace=True)
+    idx = np.concatenate((boot_pos, boot_neg))
+    
+    gt_boot = gt[idx]
+    preds_td_boot = preds_td[idx]
+    preds_sup_boot = preds_sup[idx]
+    
+    # Flip labels and predictions for AUPRC so minority class (death=0) becomes the positive class (1)
+    auprc_td = compute_auprc_score(1 - gt_boot, 1.0 - preds_td_boot)
+    auprc_sup = compute_auprc_score(1 - gt_boot, 1.0 - preds_sup_boot)
+    delta = auprc_td - auprc_sup
+        
+    return dataset, group, h, delta
 
 
 def compute_fractional_ranks(predictions):
@@ -170,14 +251,17 @@ def get_model_group(filename):
     return None
 
 
-def benjamini_hochberg_correction(p_values):
+def benjamini_yekutieli_correction(p_values):
     """
-    Performs Benjamini-Hochberg false discovery rate correction in pure Python.
+    Performs Benjamini-Yekutieli false discovery rate correction in pure Python.
     """
     p_values = np.asarray(p_values)
     n = len(p_values)
     if n == 0:
         return np.array([])
+        
+    c_n = np.sum(1.0 / np.arange(1, n + 1))
+    
     sort_idx = np.argsort(p_values)
     sorted_p = p_values[sort_idx]
     
@@ -185,14 +269,13 @@ def benjamini_hochberg_correction(p_values):
     prev_adj = 1.0
     for i in range(n - 1, -1, -1):
         rank = i + 1
-        adj = sorted_p[i] * n / rank
+        adj = sorted_p[i] * n * c_n / rank
         adj = min(adj, prev_adj)
         adjusted_p[i] = adj
         prev_adj = adj
         
     original_idx = np.argsort(sort_idx)
     return adjusted_p[original_idx]
-
 
 def run_statistical_analysis():
     results_dir = "./evaluation_results"
@@ -274,6 +357,14 @@ def run_statistical_analysis():
     model_groups_ordered = ["TD", "1d", "1d+", "3d", "3d+", "7d", "7d+", "14d", "14d+", "28d", "28d+"]
     horizons_ordered = ["1d", "3d", "7d", "14d", "28d"]
 
+    # Calculate baseline prevalences (death = 0 in original labels, so positive class is 1 - gt)
+    prevalences = {"internal": {}, "external": {}}
+    for dataset in ["internal", "external"]:
+        if labels[dataset] is not None:
+            for h in horizons_ordered:
+                gt = labels[dataset][f"label_{h}"]
+                prevalences[dataset][h] = float(np.mean(1.0 - gt))
+
     # 1. Compute raw AUROCs for each model on each horizon
     print("Preparing parallel AUROC tasks...")
     tasks = []
@@ -300,23 +391,34 @@ def run_statistical_analysis():
     )
 
     # Step C: Reassemble the results back into your nested dictionary format
-    raw_auroc_results = {"internal": {}, "external": {}}
+    raw_metrics_results = {"internal": {}, "external": {}}
     for dataset in ["internal", "external"]:
-        raw_auroc_results[dataset] = {}
+        raw_metrics_results[dataset] = {}
         for group in model_groups_ordered:
-            raw_auroc_results[dataset][group] = {}
+            raw_metrics_results[dataset][group] = {}
 
     for res in results:
-        dataset, group, h, ens_auc, seed_mean, seed_std, seed_aucs = res
-        raw_auroc_results[dataset][group][h] = {
-            "ensemble": ens_auc,
-            "seed_mean": seed_mean,
-            "seed_std": seed_std,
-            "seed_aucs": seed_aucs
+        (dataset, group, h, 
+         ens_auc, seed_mean_auc, seed_std_auc, seed_aucs,
+         ens_auprc, seed_mean_auprc, seed_std_auprc, seed_auprcs) = res
+         
+        raw_metrics_results[dataset][group][h] = {
+            "ensemble": ens_auc, # legacy key for AUROC compatibility
+            "seed_mean": seed_mean_auc,
+            "seed_std": seed_std_auc,
+            "seed_aucs": seed_aucs,
+            "ensemble_auprc": ens_auprc,
+            "seed_mean_auprc": seed_mean_auprc,
+            "seed_std_auprc": seed_std_auprc,
+            "seed_auprcs": seed_auprcs
         }
 
     # 2. Perform TD vs Supervised comparisons across all horizons
     all_tests = []
+    bootstrap_tasks = []
+
+    n_bootstraps = 1000
+
     for dataset in ["internal", "external"]:
         if "TD" not in loaded_data[dataset]:
             print(f"Warning: No TD models found for {dataset} dataset. Skipping comparisons.")
@@ -327,6 +429,9 @@ def run_statistical_analysis():
         for h in tqdm(horizons_ordered, desc=f"Running DeLong Tests ({dataset})"):
             gt = labels[dataset][f"label_{h}"]
             
+            # Create a deterministic integer seed for this dataset+horizon combination
+            seed = hash(f"{dataset}_{h}") % (2**32)
+            
             for group in model_groups_ordered:
                 if group == "TD" or group not in loaded_data[dataset]:
                     continue
@@ -336,23 +441,95 @@ def run_statistical_analysis():
                 # Perform DeLong's test
                 try:
                     auc_td, auc_group, p_val = delong_roc_test(gt, td_ensemble, group_ensemble)
+                    
+                    # Queue individual bootstrap tasks
+                    for i in range(n_bootstraps):
+                        bootstrap_tasks.append((dataset, group, h, gt, td_ensemble, group_ensemble, seed, i))
+                    
                     all_tests.append({
                         "dataset": dataset,
                         "target": h,
                         "comparison": f"TD vs {group}",
+                        "group": group,
                         "auc_td": auc_td,
                         "auc_supervised": auc_group,
-                        "p_value": p_val
+                        "p_value": p_val,
+                        "auprc_td": raw_metrics_results[dataset]["TD"][h]["ensemble_auprc"],
+                        "auprc_supervised": raw_metrics_results[dataset][group][h]["ensemble_auprc"],
+                        "auprc_diff": raw_metrics_results[dataset]["TD"][h]["ensemble_auprc"] - raw_metrics_results[dataset][group][h]["ensemble_auprc"],
                     })
                 except Exception as e:
                     print(f"Error performing DeLong's test for {dataset} {group} on {h}: {e}")
 
-    # Apply BH correction globally
+    # Apply BY correction globally for DeLong's AUROC p-values
     if all_tests:
         p_values = [t["p_value"] for t in all_tests]
-        adj_p_values = benjamini_hochberg_correction(p_values)
+        adj_p_values = benjamini_yekutieli_correction(p_values)
         for idx, adj_p in enumerate(adj_p_values):
             all_tests[idx]["adj_p_value"] = adj_p
+
+    # Execute Bootstraps
+    # n_jobs=-1 means using all available cores.
+    max_workers = os.cpu_count() // 2
+    print(f"Executing {len(bootstrap_tasks)} AUPRC bootstrap tasks across {max_workers} cores...")
+    
+    # Let Joblib batch these natively to reduce overhead
+    bootstrap_results_raw = Parallel(n_jobs=max_workers, backend="loky", batch_size="auto")(
+        delayed(_compute_single_bootstrap)(*task) 
+        for task in tqdm(bootstrap_tasks, desc="Bootstrapping AUPRC")
+    )
+    
+    # Group results back by dataset, group, and horizon
+    bootstrap_results = {}
+    for res in bootstrap_results_raw:
+        dataset, group, h, delta = res
+        key = (dataset, group, h)
+        if key not in bootstrap_results:
+            bootstrap_results[key] = []
+        bootstrap_results[key].append(delta)
+        
+    # Process bootstrap results using Benjamini-Yekutieli FCR adjustment
+    m = len(bootstrap_results)
+
+    # Calculate the BY dependency correction factor for the CIs
+    c_m = np.sum(1.0 / np.arange(1, m + 1))
+    
+    for alpha_level in [0.05, 0.01, 0.001]:
+        # Step 1: Identify R (number of intervals where unadjusted CI does not cover 0)
+        selected_keys = []
+        for key, deltas_list in bootstrap_results.items():
+            deltas = np.array(deltas_list)
+            low = np.percentile(deltas, (alpha_level / 2.0) * 100)
+            high = np.percentile(deltas, (1.0 - alpha_level / 2.0) * 100)
+            if low > 0 or high < 0:
+                selected_keys.append(key)
+        
+        R = len(selected_keys)
+
+        # Apply the c_m penalty to the FCR calculation
+        alpha_fcr = (R * alpha_level) / (m * c_m) if R > 0 else alpha_level
+
+        # Step 2: Re-extract CIs
+        for key, deltas_list in bootstrap_results.items():
+            deltas = np.array(deltas_list)
+            if key in selected_keys:
+                low = np.percentile(deltas, (alpha_fcr / 2.0) * 100)
+                high = np.percentile(deltas, (1.0 - alpha_fcr / 2.0) * 100)
+            else:
+                low = np.percentile(deltas, (alpha_level / 2.0) * 100)
+                high = np.percentile(deltas, (1.0 - alpha_level / 2.0) * 100)
+                
+            # Find the matching test entry and update it
+            dataset, group, h = key
+            for t in all_tests:
+                if t["dataset"] == dataset and t["group"] == group and t["target"] == h:
+                    if alpha_level == 0.05:
+                        t["auprc_95_ci"] = (low, high)
+                    elif alpha_level == 0.01:
+                        t["auprc_99_ci"] = (low, high)
+                    elif alpha_level == 0.001:
+                        t["auprc_999_ci"] = (low, high)
+                    break
 
     # Format the report
     report_lines = []
@@ -363,7 +540,7 @@ def run_statistical_analysis():
     report_lines.append("2. **Rank-Averaged Ensemble**: Fractional ranks were averaged across all available seeds for each model group to construct a stable ensembled prediction score.")
     report_lines.append("3. **Cross-Horizon Evaluation**: All model groups (both TD and supervised model categories) were evaluated across every target mortality horizon label (1, 3, 7, 14, and 28 day mortality).")
     report_lines.append("4. **DeLong's Test**: The ensembled TD model group was compared directly to each supervised model group (both standard and balanced `+` models) for every target mortality horizon using DeLong's test for correlated ROC curves.")
-    report_lines.append("5. **FDR Control**: P-values across all tests were corrected globally using the Benjamini-Hochberg procedure.\n")
+    report_lines.append("5. **FDR Control**: P-values across all tests were corrected globally using the Benjamini-Yekutieli procedure, and AUPRC confidence intervals were adjusted using the Benjamini-Yekutieli false coverage-statement rate (FCR) procedure.\n")
 
     # Add Raw AUROC tables first
     report_lines.append("## Raw AUROC Performance by Model and Horizon")
@@ -374,18 +551,55 @@ def run_statistical_analysis():
         report_lines.append("| Model Group | 1d Mortality | 3d Mortality | 7d Mortality | 14d Mortality | 28d Mortality |")
         report_lines.append("| --- | --- | --- | --- | --- | --- |")
         for group in model_groups_ordered:
-            if group not in raw_auroc_results[dataset]:
+            if group not in raw_metrics_results[dataset]:
                 continue
             cells = []
             for h in horizons_ordered:
-                metrics = raw_auroc_results[dataset][group][h]
+                metrics = raw_metrics_results[dataset][group][h]
                 cells.append(f"{metrics['ensemble']:.5f} ({metrics['seed_mean']:.5f} ± {metrics['seed_std']:.5f})")
+            report_lines.append(f"| **{group}** | " + " | ".join(cells) + " |")
+        report_lines.append("\n")
+
+    # Add Raw AUPRC tables
+    report_lines.append("## Raw AUPRC Performance by Model and Horizon")
+    report_lines.append("Values are displayed as **Ensemble AUPRC (LR) (Seed Mean [LR] ± SD)** across the 5 training seeds, where LR is the Likelihood Ratio relative to baseline prevalence.\n")
+
+    for dataset in ["internal", "external"]:
+        report_lines.append(f"### {dataset.upper()} Dataset - Raw AUPRC Scores")
+        report_lines.append("| Model Group | 1d Mortality | 3d Mortality | 7d Mortality | 14d Mortality | 28d Mortality |")
+        report_lines.append("| --- | --- | --- | --- | --- | --- |")
+        
+        # Add baseline prevalence row
+        prev_cells = []
+        for h in horizons_ordered:
+            prev = prevalences[dataset][h]
+            prev_cells.append(f"{prev:.5f} ({prev*100:.2f}%)")
+        report_lines.append(f"| **Baseline Prevalence** | " + " | ".join(prev_cells) + " |")
+        
+        for group in model_groups_ordered:
+            if group not in raw_metrics_results[dataset]:
+                continue
+            cells = []
+            for h in horizons_ordered:
+                metrics = raw_metrics_results[dataset][group][h]
+                prev = prevalences[dataset][h]
+                ens_auprc = metrics['ensemble_auprc']
+                seed_mean = metrics['seed_mean_auprc']
+                seed_std = metrics['seed_std_auprc']
+                
+                ens_lr = ens_auprc / prev if prev > 0 else 0.0
+                seed_mean_lr = seed_mean / prev if prev > 0 else 0.0
+                
+                cells.append(
+                    f"{ens_auprc:.5f} (LR: {ens_lr:.2f}) ({seed_mean:.5f} [LR: {seed_mean_lr:.2f}] ± {seed_std:.5f})"
+                )
             report_lines.append(f"| **{group}** | " + " | ".join(cells) + " |")
         report_lines.append("\n")
 
     # Add Statistical Comparisons tables
     report_lines.append("## Statistical Comparisons (TD vs. Supervised Models)")
-    report_lines.append("DeLong's test was conducted for every target horizon comparing the TD ensemble against each supervised ensemble model. P-values were adjusted globally for multiple comparisons using the Benjamini-Hochberg procedure.\n")
+    report_lines.append("DeLong's test was conducted for every target horizon comparing the TD ensemble against each supervised ensemble model. P-values were adjusted globally for multiple comparisons using the Benjamini-Yekutieli procedure.")
+    report_lines.append("AUPRC differences were evaluated using stratified resampling with 1000 bootstrap iterations.\n")
 
     for dataset in ["internal", "external"]:
         dataset_tests = [t for t in all_tests if t["dataset"] == dataset]
@@ -395,17 +609,38 @@ def run_statistical_analysis():
         # Sort tests to group by target horizon first
         dataset_tests_sorted = sorted(dataset_tests, key=lambda x: (horizons_ordered.index(x["target"]), x["comparison"]))
 
-        report_lines.append(f"### {dataset.upper()} Dataset - DeLong Comparison Tests")
-        report_lines.append("| Target Horizon | Comparison | TD Ensemble AUC | Supervised Ensemble AUC | Difference | Raw p-value | Adjusted p-value (BH) | Significance (α=0.05) |")
-        report_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        report_lines.append(f"### {dataset.upper()} Dataset - DeLong & Bootstrap Comparison Tests")
+        report_lines.append("| Target Horizon | Comparison | TD AUC | Sup. AUC | AUC Diff | Raw p-value | Adj p-value (BY) | TD AUPRC (LR) | Sup. AUPRC (LR) | AUPRC Diff | AUPRC 95% Bootstrap CI | AUPRC 99% Bootstrap CI | AUPRC 99.9% Bootstrap CI | AUPRC Comparison (99% CI) | AUC Comparison (α=0.01) |")
+        report_lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         
         for t in dataset_tests_sorted:
-            sig = "★ Significant" if t["adj_p_value"] < 0.05 else "Not Significant"
-            diff = t["auc_td"] - t["auc_supervised"]
-            sign_char = "+" if diff >= 0 else ""
+            sig_auc = "★ Significant" if t["adj_p_value"] < 0.01 else "Not Significant"
+            diff_auc = t["auc_td"] - t["auc_supervised"]
+            sign_char_auc = "+" if diff_auc >= 0 else ""
+            
+            diff_auprc = t["auprc_diff"]
+            sign_char_auprc = "+" if diff_auprc >= 0 else ""
+            
+            ci_95_low, ci_95_high = t["auprc_95_ci"]
+            ci_99_low, ci_99_high = t["auprc_99_ci"]
+            ci_999_low, ci_999_high = t["auprc_999_ci"]
+            
+            # Check if 99% CI contains 0
+            if ci_99_low > 0 or ci_99_high < 0:
+                sig_auprc = "★ Significant"
+            else:
+                sig_auprc = "Not Significant"
+
+            prev = prevalences[t['dataset']][t['target']]
+            td_auprc_lr = t['auprc_td'] / prev if prev > 0 else 0.0
+            sup_auprc_lr = t['auprc_supervised'] / prev if prev > 0 else 0.0
+
             report_lines.append(
-                f"| {t['target']} | {t['comparison']} | {t['auc_td']:.5f} | {t['auc_supervised']:.5f} | {sign_char}{diff:.5f} | "
-                f"{t['p_value']:.2g} | {t['adj_p_value']:.2g} | {sig} |"
+                f"| {t['target']} (Prev: {prev:.5f}) | {t['comparison']} | {t['auc_td']:.5f} | {t['auc_supervised']:.5f} | {sign_char_auc}{diff_auc:.5f} | "
+                f"{t['p_value']:.2g} | {t['adj_p_value']:.2g} | "
+                f"{t['auprc_td']:.5f} (LR: {td_auprc_lr:.2f}) | {t['auprc_supervised']:.5f} (LR: {sup_auprc_lr:.2f}) | {sign_char_auprc}{diff_auprc:.5f} | "
+                f"[{ci_95_low:.5f}, {ci_95_high:.5f}] | [{ci_99_low:.5f}, {ci_99_high:.5f}] | [{ci_999_low:.5f}, {ci_999_high:.5f}] | "
+                f"{sig_auprc} | {sig_auc} |"
             )
         report_lines.append("\n")
 
@@ -418,17 +653,40 @@ def run_statistical_analysis():
         report_lines.append("| Model Group | Target Horizon | Seed 1 | Seed 2 | Seed 3 | Seed 4 | Seed 5 |")
         report_lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for group in model_groups_ordered:
-            if group not in raw_auroc_results[dataset]:
+            if group not in raw_metrics_results[dataset]:
                 continue
             for h in horizons_ordered:
-                metrics = raw_auroc_results[dataset][group][h]
+                metrics = raw_metrics_results[dataset][group][h]
                 seed_vals = metrics["seed_aucs"]
-                # Format to 5 decimal places
                 formatted_seeds = [f"{val:.5f}" for val in seed_vals]
-                # If there are fewer than 5 seeds, pad with N/A
                 while len(formatted_seeds) < 5:
                     formatted_seeds.append("N/A")
                 report_lines.append(f"| **{group}** | {h} | " + " | ".join(formatted_seeds) + " |")
+        report_lines.append("\n")
+
+    # Add Seed-Level Raw AUPRC tables
+    report_lines.append("## Detailed Seed-Level Raw AUPRC Scores")
+    report_lines.append("Below are the individual seed AUPRC scores (one for each of the 5 training seeds) along with their Likelihood Ratio (LR) relative to baseline prevalence.\n")
+
+    for dataset in ["internal", "external"]:
+        report_lines.append(f"### {dataset.upper()} Dataset - Seed-Level Raw AUPRC Scores")
+        report_lines.append("| Model Group | Target Horizon | Seed 1 | Seed 2 | Seed 3 | Seed 4 | Seed 5 |")
+        report_lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+        for group in model_groups_ordered:
+            if group not in raw_metrics_results[dataset]:
+                continue
+            for h in horizons_ordered:
+                metrics = raw_metrics_results[dataset][group][h]
+                prev = prevalences[dataset][h]
+                seed_vals = metrics["seed_auprcs"]
+                formatted_seeds = []
+                for val in seed_vals:
+                    lr = val / prev if prev > 0 else 0.0
+                    formatted_seeds.append(f"{val:.5f} (LR: {lr:.2f})")
+                while len(formatted_seeds) < 5:
+                    formatted_seeds.append("N/A")
+                prev_pct = prev * 100
+                report_lines.append(f"| **{group}** | {h} (Prev: {prev:.5f} [{prev_pct:.2f}%]) | " + " | ".join(formatted_seeds) + " |")
         report_lines.append("\n")
 
     report_content = "\n".join(report_lines)
@@ -438,23 +696,32 @@ def run_statistical_analysis():
     with open(report_path, "w") as f:
         f.write(report_content)
     
-    # Save a separate structured JSON of raw seed AUROCs for programmatic usage
+    # Save a separate structured JSON of raw seed AUROCs and AUPRCs for programmatic usage
     import json
     json_results = []
     for dataset in ["internal", "external"]:
         for group in model_groups_ordered:
-            if group not in raw_auroc_results[dataset]:
+            if group not in raw_metrics_results[dataset]:
                 continue
             for h in horizons_ordered:
-                metrics = raw_auroc_results[dataset][group][h]
+                metrics = raw_metrics_results[dataset][group][h]
+                prev = prevalences[dataset][h]
                 json_results.append({
                     "dataset": dataset,
                     "model_group": group,
                     "target_horizon": h,
+                    "baseline_prevalence": prev,
                     "ensemble_auroc": metrics["ensemble"],
                     "seed_mean_auroc": metrics["seed_mean"],
                     "seed_std_auroc": metrics["seed_std"],
-                    "seed_aurocs": [float(val) for val in metrics["seed_aucs"]]
+                    "seed_aurocs": [float(val) for val in metrics["seed_aucs"]],
+                    "ensemble_auprc": metrics["ensemble_auprc"],
+                    "ensemble_auprc_lr": metrics["ensemble_auprc"] / prev if prev > 0 else 0.0,
+                    "seed_mean_auprc": metrics["seed_mean_auprc"],
+                    "seed_mean_auprc_lr": metrics["seed_mean_auprc"] / prev if prev > 0 else 0.0,
+                    "seed_std_auprc": metrics["seed_std_auprc"],
+                    "seed_auprcs": [float(val) for val in metrics["seed_auprcs"]],
+                    "seed_auprcs_lr": [float(val) / prev if prev > 0 else 0.0 for val in metrics["seed_auprcs"]]
                 })
 
     json_path = os.path.join(results_dir, "seed_level_aurocs.json")

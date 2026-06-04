@@ -861,7 +861,7 @@ def create_hdf5_array(target_path, batch_dir, features, label_features, context_
     # Delete the sse dataset, as this is no longer required
     del h5_array['sse']
 
-    scaling_df = pl.read_parquet(scaling_path)
+    scaling_df = pl.read_parquet(scaling_path).rename({f'value_{key}': f'values_{key}' for key in ['max', 'min', 'mean', 'std']})
     for idx, feature in enumerate(features):
         current_feature_df = scaling_df.filter(pl.col('str_feature') == feature)
         if current_feature_df.is_empty():
