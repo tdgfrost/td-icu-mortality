@@ -108,8 +108,15 @@ def generate_plot(metric):
     ens_col = 'ensemble_auroc' if metric == 'AUROC' else 'ensemble_auprc'
     file_name = 'final_aurocs_with_significance.pdf' if metric == 'AUROC' else 'final_auprcs_with_significance.pdf'
     
-    df_exploded = df.explode(seed_col)
-    df_exploded[seed_col] = df_exploded[seed_col].astype(float)
+    if metric == 'AUPRC':
+        # Normalize the ensemble AUPRC by baseline prevalence
+        df['ensemble_auprc'] = df['ensemble_auprc'] / df['baseline_prevalence']
+        # Explode and normalize seed AUPRCs by baseline prevalence
+        df_exploded = df.explode(seed_col)
+        df_exploded[seed_col] = df_exploded[seed_col].astype(float) / df_exploded['baseline_prevalence']
+    else:
+        df_exploded = df.explode(seed_col)
+        df_exploded[seed_col] = df_exploded[seed_col].astype(float)
     
     datasets = ['internal', 'external']
     horizons = ['1d', '3d', '7d', '14d', '28d']
@@ -129,6 +136,18 @@ def generate_plot(metric):
             
             sub_exp = df_exploded[(df_exploded['dataset'] == ds) & (df_exploded['target_horizon'] == hz)]
             sub_ens = df[(df['dataset'] == ds) & (df['target_horizon'] == hz)]
+            
+            # Calculate star_offset and dynamic y-limit if AUPRC
+            if metric == 'AUPRC':
+                subplot_max_y = 0.0
+                for model in model_order:
+                    model_seeds = sub_exp[sub_exp['model_group'] == model][seed_col]
+                    model_ens = sub_ens[sub_ens['model_group'] == model][ens_col]
+                    if len(model_seeds) > 0 and len(model_ens) > 0:
+                        subplot_max_y = max(subplot_max_y, model_seeds.max(), model_ens.max())
+                star_offset = subplot_max_y * 0.015
+            else:
+                star_offset = 0.005
             
             # Draw the Bar Plot
             sns.barplot(
@@ -161,7 +180,7 @@ def generate_plot(metric):
                 # Place the text slightly above the highest point of the swarm
                 ax.text(
                     x=idx,
-                    y=model_max_y + 0.005,  # Offset above the highest seed
+                    y=model_max_y + star_offset,  # Offset above the highest seed
                     s=sig_text,
                     ha='center',
                     va='bottom',
@@ -174,7 +193,7 @@ def generate_plot(metric):
             if metric == 'AUROC':
                 ax.set_ylim(0.5, 0.99)
             else:
-                ax.set_ylim(0.0, 0.85)
+                ax.set_ylim(0.0, subplot_max_y * 1.15)
                 
             ax.set_xlabel("")
             ax.tick_params(axis='x', rotation=60, labelsize=16)
@@ -185,7 +204,8 @@ def generate_plot(metric):
                 
             if j == 0:
                 row_label = "A (Internal)" if i == 0 else "B (External)"
-                ax.set_ylabel(f"{row_label}\n\n{metric}", fontsize=16, fontweight='bold', rotation=0, labelpad=50, va='center')
+                label_metric = "AUPRC / Prevalence" if metric == 'AUPRC' else metric
+                ax.set_ylabel(f"{row_label}\n\n{label_metric}", fontsize=16, fontweight='bold', rotation=0, labelpad=50, va='center')
             else:
                 ax.set_ylabel("")
                 
